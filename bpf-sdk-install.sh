@@ -2,7 +2,7 @@
 set -e
 
 installDir=$1
-channel=v1.2.17
+channel=v1.3.15
 
 if [[ -n $2 ]]; then
   channel=$2
@@ -13,7 +13,7 @@ echo "Installing $channel BPF SDK into $installDir"
 set -x
 cd "$installDir/"
 curl -L  --retry 5 --retry-delay 2 -o bpf-sdk.tar.bz2 \
-  http://solana-sdk.s3.amazonaws.com/"$channel"/bpf-sdk.tar.bz2
+  https://solana-sdk.s3.amazonaws.com/"$channel"/bpf-sdk.tar.bz2
 rm -rf bpf-sdk
 mkdir -p bpf-sdk
 tar jxf bpf-sdk.tar.bz2

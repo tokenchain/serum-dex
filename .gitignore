@@ -1,5 +1,6 @@
-bin/
-dex/target
-crank/target
-.idea*
+bin/*
+.idea/
+target/
 *~
+*.swp
+*.swo

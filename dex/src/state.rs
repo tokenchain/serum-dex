@@ -1,6 +1,8 @@
 #![cfg_attr(not(feature = "program"), allow(unused))]
 use num_enum::TryFromPrimitive;
-use std::{cell::RefMut, convert::TryInto, mem::size_of, num::NonZeroU64, ops::DerefMut};
+use std::{
+    cell::RefMut, convert::identity, convert::TryInto, mem::size_of, num::NonZeroU64, ops::DerefMut,
+};
 
 use arrayref::{array_ref, array_refs, mut_array_refs};
 
@@ -12,31 +14,24 @@ use enumflags2::BitFlags;
 use num_traits::FromPrimitive;
 use safe_transmute::{self, to_bytes::transmute_to_bytes, trivial::TriviallyTransmutable};
 
-#[cfg(feature = "program")]
-use solana_sdk::info;
-
-#[cfg(not(feature = "program"))]
-macro_rules! info {
-    ($($i:expr),*) => { { ($($i),*) } };
-}
-
-use solana_sdk::{
+use solana_program::{
     account_info::AccountInfo,
+    info,
     program_error::ProgramError,
+    program_pack::Pack,
     pubkey::Pubkey,
     rent::Rent,
     sysvar::{Sysvar, SysvarId},
 };
 use spl_token::error::TokenError;
-use spl_token::pack::Pack;
 
 use crate::{
     critbit::Slab,
     error::{DexErrorCode, DexResult, SourceFileId},
-    fees::FeeTier,
+    fees::{self, FeeTier},
     instruction::{
         disable_authority, fee_sweeper, msrm_token, srm_token, CancelOrderInstruction,
-        InitializeMarketInstruction, MarketInstruction, NewOrderInstruction,
+        InitializeMarketInstruction, MarketInstruction, NewOrderInstructionV2, SelfTradeBehavior,
     },
     matching::{OrderBookState, OrderType, Side},
 };
@@ -48,6 +43,7 @@ pub trait ToAlignedBytes {
 }
 
 impl ToAlignedBytes for Pubkey {
+    #[inline]
     fn to_aligned_bytes(&self) -> [u64; 4] {
         cast(self.to_bytes())
     }
@@ -68,7 +64,7 @@ pub enum AccountFlag {
 
 #[cfg_attr(target_endian = "little", derive(Debug))]
 #[derive(Copy, Clone)]
-#[repr(C)]
+#[repr(packed)]
 pub struct MarketState {
     // 0
     pub account_flags: u64, // Initialized, Market
@@ -117,6 +113,8 @@ pub struct MarketState {
 
     // 45
     pub fee_rate_bps: u64,
+    // 46
+    pub referrer_rebates_accrued: u64,
 }
 #[cfg(target_endian = "little")]
 unsafe impl Zeroable for MarketState {}
@@ -191,6 +189,7 @@ pub fn strip_header<'a, H: Pod, D: Pod>(
 }
 
 impl MarketState {
+    #[inline]
     pub fn load<'a>(
         market_account: &'a AccountInfo,
         program_id: &Pubkey,
@@ -211,6 +210,7 @@ impl MarketState {
         Ok(state)
     }
 
+    #[inline]
     pub fn check_flags(&self) -> DexResult {
         let flags = BitFlags::from_bits(self.account_flags)
             .map_err(|_| DexErrorCode::InvalidMarketFlags)?;
@@ -242,13 +242,16 @@ impl MarketState {
             if !rent.is_exempt(open_orders_lamports, open_orders_data_len) {
                 return Err(DexErrorCode::OrdersNotRentExempt)?;
             }
-            open_orders.init(&self.own_address, &owner_account.key.to_aligned_bytes())?;
+            open_orders.init(
+                &identity(self.own_address),
+                &owner_account.key.to_aligned_bytes(),
+            )?;
         }
         open_orders.check_flags()?;
-        check_assert_eq!(&open_orders.market, &self.own_address)
+        check_assert_eq!(identity(open_orders.market), identity(self.own_address))
             .map_err(|_| DexErrorCode::WrongOrdersAccount)?;
         if let Some(owner) = owner_account {
-            check_assert_eq!(&open_orders.owner, &owner.key.to_aligned_bytes())
+            check_assert_eq!(&identity(open_orders.owner), &owner.key.to_aligned_bytes())
                 .map_err(|_| DexErrorCode::WrongOrdersAccount)?;
         }
 
@@ -256,7 +259,7 @@ impl MarketState {
     }
 
     fn load_bids_mut<'a>(&self, bids: &'a AccountInfo) -> DexResult<RefMut<'a, Slab>> {
-        check_assert_eq!(&bids.key.to_aligned_bytes(), &self.bids)
+        check_assert_eq!(&bids.key.to_aligned_bytes(), &identity(self.bids))
             .map_err(|_| DexErrorCode::WrongBidsAccount)?;
         let (header, buf) = strip_header::<OrderBookStateHeader, u8>(bids, false)?;
         let flags = BitFlags::from_bits(header.account_flags).unwrap();
@@ -265,7 +268,7 @@ impl MarketState {
     }
 
     fn load_asks_mut<'a>(&self, asks: &'a AccountInfo) -> DexResult<RefMut<'a, Slab>> {
-        check_assert_eq!(&asks.key.to_aligned_bytes(), &self.asks)
+        check_assert_eq!(&asks.key.to_aligned_bytes(), &identity(self.asks))
             .map_err(|_| DexErrorCode::WrongAsksAccount)?;
         let (header, buf) = strip_header::<OrderBookStateHeader, u8>(asks, false)?;
         let flags = BitFlags::from_bits(header.account_flags).unwrap();
@@ -274,7 +277,7 @@ impl MarketState {
     }
 
     fn load_request_queue_mut<'a>(&self, queue: &'a AccountInfo) -> DexResult<RequestQueue<'a>> {
-        check_assert_eq!(&queue.key.to_aligned_bytes(), &self.req_q)
+        check_assert_eq!(&queue.key.to_aligned_bytes(), &identity(self.req_q))
             .map_err(|_| DexErrorCode::WrongRequestQueueAccount)?;
 
         let (header, buf) = strip_header::<RequestQueueHeader, Request>(queue, false)?;
@@ -287,7 +290,7 @@ impl MarketState {
     }
 
     fn load_event_queue_mut<'a>(&self, queue: &'a AccountInfo) -> DexResult<EventQueue<'a>> {
-        check_assert_eq!(&queue.key.to_aligned_bytes(), &self.event_q)
+        check_assert_eq!(&queue.key.to_aligned_bytes(), &identity(self.event_q))
             .map_err(|_| DexErrorCode::WrongEventQueueAccount)?;
         let (header, buf) = strip_header::<EventQueueHeader, Event>(queue, false)?;
 
@@ -299,34 +302,40 @@ impl MarketState {
         Ok(Queue { header, buf })
     }
 
+    #[inline]
     fn check_coin_vault(&self, vault: account_parser::TokenAccount) -> DexResult {
-        if self.coin_vault != vault.inner().key.to_aligned_bytes() {
+        if identity(self.coin_vault) != vault.inner().key.to_aligned_bytes() {
             Err(DexErrorCode::WrongCoinVault)?
         }
         Ok(())
     }
 
+    #[inline]
     fn check_pc_vault(&self, vault: account_parser::TokenAccount) -> DexResult {
-        if self.pc_vault != vault.inner().key.to_aligned_bytes() {
+        if identity(self.pc_vault) != vault.inner().key.to_aligned_bytes() {
             Err(DexErrorCode::WrongPcVault)?
         }
         Ok(())
     }
 
+    #[inline]
     fn check_coin_payer(&self, payer: account_parser::TokenAccount) -> DexResult {
-        if &payer.inner().try_borrow_data()?[..32] != transmute_to_bytes(&self.coin_mint) {
+        if &payer.inner().try_borrow_data()?[..32] != transmute_to_bytes(&identity(self.coin_mint))
+        {
             Err(DexErrorCode::WrongCoinMint)?
         }
         Ok(())
     }
 
+    #[inline]
     fn check_pc_payer(&self, payer: account_parser::TokenAccount) -> DexResult {
-        if &payer.inner().try_borrow_data()?[..32] != transmute_to_bytes(&self.pc_mint) {
+        if &payer.inner().try_borrow_data()?[..32] != transmute_to_bytes(&identity(self.pc_mint)) {
             Err(DexErrorCode::WrongPcMint)?
         }
         Ok(())
     }
 
+    #[inline]
     fn load_fee_tier(
         &self,
         expected_owner: &[u64; 4],
@@ -363,12 +372,12 @@ impl MarketState {
     }
 
     fn pubkey(&self) -> Pubkey {
-        Pubkey::new(transmute_to_bytes(&self.own_address as &[_]))
+        Pubkey::new(cast_slice(&identity(self.own_address) as &[_]))
     }
 }
 
 #[cfg_attr(feature = "fuzz", derive(Debug))]
-#[repr(C)]
+#[repr(packed)]
 #[derive(Copy, Clone)]
 pub struct OpenOrders {
     pub account_flags: u64, // Initialized, OpenOrders
@@ -386,6 +395,7 @@ pub struct OpenOrders {
     pub orders: [u128; 128],
     // Using Option<NonZeroU64> in a pod type requires nightly
     pub client_order_ids: [u64; 128],
+    pub referrer_rebates_accrued: u64,
 }
 unsafe impl Pod for OpenOrders {}
 unsafe impl Zeroable for OpenOrders {}
@@ -402,7 +412,7 @@ impl OpenOrders {
     }
 
     fn init(&mut self, market: &[u64; 4], owner: &[u64; 4]) -> DexResult<()> {
-        check_assert_eq!(&self.account_flags, &0)?;
+        check_assert_eq!(self.account_flags, 0)?;
         self.account_flags = (AccountFlag::Initialized | AccountFlag::OpenOrders).bits();
         self.market = *market;
         self.owner = *owner;
@@ -490,9 +500,9 @@ pub trait QueueHeader: Pod {
     type Item: Pod + Copy;
 
     fn head(&self) -> u64;
-    fn head_mut(&mut self) -> &mut u64;
+    fn set_head(&mut self, value: u64);
     fn count(&self) -> u64;
-    fn count_mut(&mut self) -> &mut u64;
+    fn set_count(&mut self, value: u64);
 
     fn incr_event_id(&mut self);
     fn decr_event_id(&mut self, n: u64);
@@ -530,7 +540,10 @@ impl<'a, H: QueueHeader> Queue<'a, H> {
         }
         let slot = ((self.header.head() + self.header.count()) as usize) % self.buf.len();
         self.buf[slot] = value;
-        *self.header.count_mut() += 1;
+
+        let count = self.header.count();
+        self.header.set_count(count + 1);
+
         self.header.incr_event_id();
         Ok(())
     }
@@ -557,9 +570,13 @@ impl<'a, H: QueueHeader> Queue<'a, H> {
             return Err(());
         }
         let value = self.buf[self.header.head() as usize];
-        *self.header.count_mut() -= 1;
-        let head = self.header.head_mut();
-        *head = (*head + 1) % self.buf.len() as u64;
+
+        let count = self.header.count();
+        self.header.set_count(count - 1);
+
+        let head = self.header.head();
+        self.header.set_head((head + 1) % self.buf.len() as u64);
+
         Ok(value)
     }
 
@@ -567,7 +584,7 @@ impl<'a, H: QueueHeader> Queue<'a, H> {
     pub fn revert_pushes(&mut self, desired_len: u64) -> DexResult<()> {
         check_assert!(desired_len <= self.header.count())?;
         let len_diff = self.header.count() - desired_len;
-        *self.header.count_mut() = desired_len;
+        self.header.set_count(desired_len);
         self.header.decr_event_id(len_diff);
         Ok(())
     }
@@ -600,7 +617,7 @@ impl<'a, 'b, H: QueueHeader> Iterator for QueueIterator<'a, 'b, H> {
 }
 
 #[derive(Copy, Clone, Debug)]
-#[repr(C)]
+#[repr(packed)]
 pub struct RequestQueueHeader {
     account_flags: u64, // Initialized, RequestQueue
     head: u64,
@@ -616,14 +633,14 @@ impl QueueHeader for RequestQueueHeader {
     fn head(&self) -> u64 {
         self.head
     }
-    fn head_mut(&mut self) -> &mut u64 {
-        &mut self.head
+    fn set_head(&mut self, value: u64) {
+        self.head = value;
     }
     fn count(&self) -> u64 {
         self.count
     }
-    fn count_mut(&mut self) -> &mut u64 {
-        &mut self.count
+    fn set_count(&mut self, value: u64) {
+        self.count = value;
     }
     #[inline(always)]
     fn incr_event_id(&mut self) {}
@@ -659,15 +676,17 @@ enum RequestFlag {
     Bid = 0x04,
     PostOnly = 0x08,
     ImmediateOrCancel = 0x10,
+    DecrementTakeOnSelfTrade = 0x20,
 }
 
 #[derive(Copy, Clone, Debug)]
-#[repr(C)]
+#[repr(packed)]
 pub struct Request {
     request_flags: u8,
     owner_slot: u8,
     fee_tier: u8,
-    padding: [u8; 5],
+    self_trade_behavior: u8,
+    padding: [u8; 4],
     max_coin_qty_or_cancel_id: u64,
     native_pc_qty_locked: u64,
     order_id: u128,
@@ -678,30 +697,31 @@ unsafe impl Zeroable for Request {}
 unsafe impl Pod for Request {}
 
 #[derive(Debug)]
-pub enum RequestView<'a> {
+pub enum RequestView {
     NewOrder {
         side: Side,
         order_type: OrderType,
         owner_slot: u8,
         fee_tier: FeeTier,
-        order_id: &'a u128,
+        order_id: u128,
         max_coin_qty: NonZeroU64,
         native_pc_qty_locked: Option<NonZeroU64>,
-        owner: &'a [u64; 4],
+        owner: [u64; 4],
         client_order_id: Option<NonZeroU64>,
+        self_trade_behavior: SelfTradeBehavior,
     },
     CancelOrder {
         side: Side,
-        order_id: &'a u128,
+        order_id: u128,
         cancel_id: u64,
         expected_owner_slot: u8,
-        expected_owner: &'a [u64; 4],
+        expected_owner: [u64; 4],
         client_order_id: Option<NonZeroU64>,
     },
 }
 
 impl Request {
-    #[inline]
+    #[inline(always)]
     pub fn new(view: RequestView) -> Self {
         match view {
             RequestView::NewOrder {
@@ -714,6 +734,7 @@ impl Request {
                 max_coin_qty,
                 native_pc_qty_locked,
                 client_order_id,
+                self_trade_behavior,
             } => {
                 let mut flags = BitFlags::from_flag(RequestFlag::NewOrder);
                 if side == Side::Bid {
@@ -729,9 +750,10 @@ impl Request {
                     request_flags: flags.bits(),
                     owner_slot,
                     fee_tier: fee_tier.into(),
+                    self_trade_behavior: self_trade_behavior.into(),
                     padding: Zeroable::zeroed(),
-                    order_id: *order_id,
-                    owner: *owner,
+                    order_id,
+                    owner,
                     max_coin_qty_or_cancel_id: max_coin_qty.get(),
                     native_pc_qty_locked: native_pc_qty_locked.map_or(0, NonZeroU64::get),
                     client_order_id: client_order_id.map_or(0, NonZeroU64::get),
@@ -752,10 +774,11 @@ impl Request {
                 Request {
                     request_flags: flags.bits(),
                     max_coin_qty_or_cancel_id: cancel_id,
-                    order_id: *order_id,
+                    order_id,
                     owner_slot: expected_owner_slot,
                     fee_tier: 0,
-                    owner: *expected_owner,
+                    self_trade_behavior: 0,
+                    owner: expected_owner,
                     native_pc_qty_locked: 0,
                     padding: Zeroable::zeroed(),
                     client_order_id: client_order_id.map_or(0, NonZeroU64::get),
@@ -764,17 +787,8 @@ impl Request {
         }
     }
 
-    #[inline]
+    #[inline(always)]
     pub fn as_view(&self) -> DexResult<RequestView> {
-        info!("(flags, slot, price, priority, 0)");
-        info!(
-            self.request_flags as u64,
-            self.owner_slot as u64,
-            (self.order_id >> 64) as u64,
-            self.order_id as u64,
-            0
-        );
-
         let flags = BitFlags::from_bits(self.request_flags).unwrap();
         let side = if flags.contains(RequestFlag::Bid) {
             Side::Bid
@@ -795,13 +809,18 @@ impl Request {
                 (false, false) => OrderType::Limit,
                 (true, true) => unreachable!(),
             };
+            let fee_tier = FeeTier::try_from_primitive(self.fee_tier).or(check_unreachable!())?;
+            let self_trade_behavior =
+                SelfTradeBehavior::try_from_primitive(self.self_trade_behavior)
+                    .or(check_unreachable!())?;
             Ok(RequestView::NewOrder {
                 side,
                 order_type,
                 owner_slot: self.owner_slot,
-                fee_tier: FeeTier::try_from_primitive(self.fee_tier).unwrap(),
-                order_id: &self.order_id,
-                owner: &self.owner,
+                fee_tier,
+                self_trade_behavior,
+                order_id: self.order_id,
+                owner: self.owner,
                 max_coin_qty: NonZeroU64::new(self.max_coin_qty_or_cancel_id).unwrap(),
                 native_pc_qty_locked: NonZeroU64::new(self.native_pc_qty_locked),
                 client_order_id: NonZeroU64::new(self.client_order_id),
@@ -816,9 +835,9 @@ impl Request {
             Ok(RequestView::CancelOrder {
                 side,
                 cancel_id: self.max_coin_qty_or_cancel_id,
-                order_id: &self.order_id,
+                order_id: self.order_id,
                 expected_owner_slot: self.owner_slot,
-                expected_owner: &self.owner,
+                expected_owner: self.owner,
                 client_order_id: NonZeroU64::new(self.client_order_id),
             })
         }
@@ -826,7 +845,7 @@ impl Request {
 }
 
 #[derive(Copy, Clone, Debug)]
-#[repr(C)]
+#[repr(packed)]
 pub struct EventQueueHeader {
     account_flags: u64, // Initialized, EventQueue
     head: u64,
@@ -845,14 +864,14 @@ impl QueueHeader for EventQueueHeader {
     fn head(&self) -> u64 {
         self.head
     }
-    fn head_mut(&mut self) -> &mut u64 {
-        &mut self.head
+    fn set_head(&mut self, value: u64) {
+        self.head = value;
     }
     fn count(&self) -> u64 {
         self.count
     }
-    fn count_mut(&mut self) -> &mut u64 {
-        &mut self.count
+    fn set_count(&mut self, value: u64) {
+        self.count = value;
     }
     fn incr_event_id(&mut self) {
         self.seq_num += 1;
@@ -874,6 +893,7 @@ enum EventFlag {
 }
 
 impl EventFlag {
+    #[inline]
     fn from_side(side: Side) -> BitFlags<Self> {
         match side {
             Side::Bid => EventFlag::Bid.into(),
@@ -881,6 +901,7 @@ impl EventFlag {
         }
     }
 
+    #[inline]
     fn flags_to_side(flags: BitFlags<Self>) -> Side {
         if flags.contains(EventFlag::Bid) {
             Side::Bid
@@ -891,7 +912,7 @@ impl EventFlag {
 }
 
 #[derive(Copy, Clone, Debug)]
-#[repr(C)]
+#[repr(packed)]
 pub struct Event {
     event_flags: u8,
     owner_slot: u8,
@@ -915,7 +936,7 @@ unsafe impl TriviallyTransmutable for Event {}
 unsafe impl TriviallyTransmutable for Request {}
 
 impl Event {
-    #[inline]
+    #[inline(always)]
     pub fn new(view: EventView) -> Self {
         match view {
             EventView::Fill {
@@ -948,8 +969,8 @@ impl Event {
                     native_qty_paid,
                     native_fee_or_rebate,
 
-                    order_id: *order_id,
-                    owner: *owner,
+                    order_id,
+                    owner,
 
                     client_order_id: client_order_id.map_or(0, NonZeroU64::get),
                 }
@@ -976,14 +997,15 @@ impl Event {
                     native_qty_paid: native_qty_still_locked,
                     native_fee_or_rebate: 0,
 
-                    order_id: *order_id,
-                    owner: *owner,
+                    order_id,
+                    owner,
                     client_order_id: client_order_id.map_or(0, NonZeroU64::get),
                 }
             }
         }
     }
 
+    #[inline(always)]
     pub fn as_view(&self) -> DexResult<EventView> {
         let flags = BitFlags::from_bits(self.event_flags).unwrap();
         let side = EventFlag::flags_to_side(flags);
@@ -1002,8 +1024,8 @@ impl Event {
                 native_qty_received: self.native_qty_released,
                 native_fee_or_rebate: self.native_fee_or_rebate,
 
-                order_id: &self.order_id,
-                owner: &self.owner,
+                order_id: self.order_id,
+                owner: self.owner,
 
                 owner_slot: self.owner_slot,
                 fee_tier: self.fee_tier.try_into().or(check_unreachable!())?,
@@ -1020,8 +1042,8 @@ impl Event {
             native_qty_unlocked: self.native_qty_released,
             native_qty_still_locked: self.native_qty_paid,
 
-            order_id: &self.order_id,
-            owner: &self.owner,
+            order_id: self.order_id,
+            owner: self.owner,
 
             owner_slot: self.owner_slot,
             client_order_id,
@@ -1030,15 +1052,15 @@ impl Event {
 }
 
 #[derive(Debug)]
-pub enum EventView<'a> {
+pub enum EventView {
     Fill {
         side: Side,
         maker: bool,
         native_qty_paid: u64,
         native_qty_received: u64,
         native_fee_or_rebate: u64,
-        order_id: &'a u128,
-        owner: &'a [u64; 4],
+        order_id: u128,
+        owner: [u64; 4],
         owner_slot: u8,
         fee_tier: FeeTier,
         client_order_id: Option<NonZeroU64>,
@@ -1047,14 +1069,14 @@ pub enum EventView<'a> {
         side: Side,
         native_qty_unlocked: u64,
         native_qty_still_locked: u64,
-        order_id: &'a u128,
-        owner: &'a [u64; 4],
+        order_id: u128,
+        owner: [u64; 4],
         owner_slot: u8,
         client_order_id: Option<NonZeroU64>,
     },
 }
 
-impl<'a> EventView<'a> {
+impl EventView {
     fn side(&self) -> Side {
         match self {
             &EventView::Fill { side, .. } | &EventView::Out { side, .. } => side,
@@ -1063,7 +1085,7 @@ impl<'a> EventView<'a> {
 }
 
 #[derive(Copy, Clone)]
-#[repr(C)]
+#[repr(packed)]
 struct OrderBookStateHeader {
     account_flags: u64, // Initialized, (Bids or Asks)
 }
@@ -1098,21 +1120,20 @@ pub fn gen_vault_signer_key(
 }
 
 #[cfg(not(feature = "fuzz"))]
-#[cfg(feature = "program")]
 fn invoke_spl_token(
-    instruction: &solana_sdk::instruction::Instruction,
+    instruction: &solana_program::instruction::Instruction,
     account_infos: &[AccountInfo],
     signers_seeds: &[&[&[u8]]],
-) -> solana_sdk::entrypoint::ProgramResult {
-    solana_sdk::program::invoke_signed(instruction, account_infos, signers_seeds)
+) -> solana_program::entrypoint::ProgramResult {
+    solana_program::program::invoke_signed(instruction, account_infos, signers_seeds)
 }
 
 #[cfg(feature = "fuzz")]
 fn invoke_spl_token(
-    instruction: &solana_sdk::instruction::Instruction,
+    instruction: &solana_program::instruction::Instruction,
     account_infos: &[AccountInfo],
     _signers_seeds: &[&[&[u8]]],
-) -> solana_sdk::entrypoint::ProgramResult {
+) -> solana_program::entrypoint::ProgramResult {
     assert_eq!(instruction.program_id, spl_token::ID);
     let account_infos: Vec<AccountInfo> = instruction
         .accounts
@@ -1125,11 +1146,42 @@ fn invoke_spl_token(
                 .clone()
         })
         .collect();
+    info!("invoking...");
     spl_token::processor::Processor::process(
         &instruction.program_id,
         &account_infos,
         &instruction.data,
-    )
+    )?;
+    info!("invoked");
+    Ok(())
+}
+
+#[cfg(feature = "program")]
+fn send_from_vault<'a, 'b: 'a>(
+    native_amount: u64,
+    recipient: account_parser::TokenAccount<'a, 'b>,
+    vault: account_parser::TokenAccount<'a, 'b>,
+    spl_token_program: account_parser::SplTokenProgram<'a, 'b>,
+    vault_signer: account_parser::VaultSigner<'a, 'b>,
+    vault_signer_seeds: &[&[u8]],
+) -> DexResult {
+    let deposit_instruction = spl_token::instruction::transfer(
+        &spl_token::ID,
+        vault.inner().key,
+        recipient.inner().key,
+        &vault_signer.inner().key,
+        &[],
+        native_amount,
+    )?;
+    let accounts: &[AccountInfo] = &[
+        vault.inner().clone(),
+        recipient.inner().clone(),
+        vault_signer.inner().clone(),
+        spl_token_program.inner().clone(),
+    ];
+    invoke_spl_token(&deposit_instruction, &accounts[..], &[vault_signer_seeds])
+        .map_err(|_| DexErrorCode::TransferFailed)?;
+    Ok(())
 }
 
 pub mod account_parser {
@@ -1393,10 +1445,10 @@ pub mod account_parser {
     }
 
     pub struct NewOrderArgs<'a, 'b: 'a> {
-        pub instruction: &'a NewOrderInstruction,
+        pub instruction: &'a NewOrderInstructionV2,
         pub market: &'a mut MarketState,
         pub open_orders: &'a mut OpenOrders,
-        pub open_orders_address: &'a [u64; 4],
+        pub open_orders_address: [u64; 4],
         pub owner: SignerAccount<'a, 'b>,
         pub req_q: RequestQueue<'a>,
         pub payer: TokenAccount<'a, 'b>,
@@ -1408,7 +1460,7 @@ pub mod account_parser {
     impl<'a, 'b: 'a> NewOrderArgs<'a, 'b> {
         pub fn with_parsed_args<T>(
             program_id: &'a Pubkey,
-            instruction: &'a NewOrderInstruction,
+            instruction: &'a NewOrderInstructionV2,
             accounts: &'a [AccountInfo<'b>],
             f: impl FnOnce(NewOrderArgs) -> DexResult<T>,
         ) -> DexResult<T> {
@@ -1448,7 +1500,7 @@ pub mod account_parser {
                 program_id,
                 Some(rent),
             )?;
-            let ref open_orders_address = open_orders_acc.key.to_aligned_bytes();
+            let open_orders_address = open_orders_acc.key.to_aligned_bytes();
             let req_q = market.load_request_queue_mut(req_q_acc)?;
 
             let payer = TokenAccount::new(payer_acc)?;
@@ -1564,7 +1616,7 @@ pub mod account_parser {
     pub struct CancelOrderArgs<'a, 'b: 'a> {
         pub instruction: &'a CancelOrderInstruction,
         pub open_orders: &'a mut OpenOrders,
-        pub open_orders_address: &'a [u64; 4],
+        pub open_orders_address: [u64; 4],
         pub req_q: RequestQueue<'a>,
         pub orders_owner: SignerAccount<'a, 'b>,
     }
@@ -1587,7 +1639,7 @@ pub mod account_parser {
             let owner = SignerAccount::new(owner_acc)?;
             let mut open_orders =
                 market.load_orders_mut(open_orders_acc, Some(owner.inner()), program_id, None)?;
-            let ref open_orders_address = open_orders_acc.key.to_aligned_bytes();
+            let open_orders_address = open_orders_acc.key.to_aligned_bytes();
             let req_q = market.load_request_queue_mut(req_q_acc)?;
             let args = CancelOrderArgs {
                 instruction,
@@ -1603,7 +1655,7 @@ pub mod account_parser {
     pub struct CancelOrderByClientIdArgs<'a, 'b: 'a> {
         pub client_order_id: NonZeroU64,
         pub open_orders: &'a mut OpenOrders,
-        pub open_orders_address: &'a [u64; 4],
+        pub open_orders_address: [u64; 4],
         pub req_q: RequestQueue<'a>,
         pub orders_owner: SignerAccount<'a, 'b>,
     }
@@ -1627,7 +1679,7 @@ pub mod account_parser {
             let owner = SignerAccount::new(owner_acc)?;
             let mut open_orders =
                 market.load_orders_mut(open_orders_acc, Some(owner.inner()), program_id, None)?;
-            let ref open_orders_address = open_orders_acc.key.to_aligned_bytes();
+            let open_orders_address = open_orders_acc.key.to_aligned_bytes();
             let req_q = market.load_request_queue_mut(req_q_acc)?;
             let args = CancelOrderByClientIdArgs {
                 client_order_id,
@@ -1649,6 +1701,7 @@ pub mod account_parser {
         pub pc_wallet: PcWallet<'a, 'b>,
         pub vault_signer: VaultSigner<'a, 'b>,
         pub spl_token_program: SplTokenProgram<'a, 'b>,
+        pub referrer: Option<PcWallet<'a, 'b>>,
     }
     impl<'a, 'b: 'a> SettleFundsArgs<'a, 'b> {
         pub fn with_parsed_args<T>(
@@ -1656,8 +1709,9 @@ pub mod account_parser {
             accounts: &'a [AccountInfo<'b>],
             f: impl FnOnce(SettleFundsArgs) -> DexResult<T>,
         ) -> DexResult<T> {
-            check_assert_eq!(accounts.len(), 9)?;
-            let &[
+            check_assert!(accounts.len() == 9 || accounts.len() == 10)?;
+            #[rustfmt::skip]
+            let (&[
                 ref market_acc,
                 ref open_orders_acc,
                 ref owner_acc,
@@ -1667,7 +1721,7 @@ pub mod account_parser {
                 ref pc_wallet_acc,
                 ref vault_signer_acc,
                 ref spl_token_program_acc,
-            ]: &'a [AccountInfo<'b>; 9] = array_ref![accounts, 0, 9];
+            ], remaining_accounts) = array_refs![accounts, 9; ..;];
             let spl_token_program = SplTokenProgram::new(spl_token_program_acc)?;
             let mut market = MarketState::load(market_acc, program_id)?;
             let owner = SignerAccount::new(owner_acc).or(check_unreachable!())?;
@@ -1679,6 +1733,14 @@ pub mod account_parser {
                 CoinWallet::from_account(coin_wallet_acc, &market).or(check_unreachable!())?;
             let pc_wallet =
                 PcWallet::from_account(pc_wallet_acc, &market).or(check_unreachable!())?;
+
+            let referrer = match remaining_accounts {
+                &[] => None,
+                &[ref referrer_acc] => {
+                    Some(PcWallet::from_account(referrer_acc, &market).or(check_unreachable!())?)
+                }
+                _ => check_unreachable!()?,
+            };
 
             let vault_signer = VaultSigner::new(vault_signer_acc, &market, program_id)?;
 
@@ -1694,6 +1756,7 @@ pub mod account_parser {
                 pc_wallet,
                 vault_signer,
                 spl_token_program,
+                referrer,
             };
             f(args)
         }
@@ -1790,7 +1853,16 @@ impl State {
             MarketInstruction::InitializeMarket(ref inner) => Self::process_initialize_market(
                 account_parser::InitializeMarketArgs::new(program_id, inner, accounts)?,
             )?,
-            MarketInstruction::NewOrder(ref inner) => {
+            MarketInstruction::NewOrder(inner) => {
+                let new_order_v2 = inner.add_self_trade_behavior(SelfTradeBehavior::DecrementTake);
+                account_parser::NewOrderArgs::with_parsed_args(
+                    program_id,
+                    &new_order_v2,
+                    accounts,
+                    Self::process_new_order,
+                )?
+            }
+            MarketInstruction::NewOrderV2(ref inner) => {
                 account_parser::NewOrderArgs::with_parsed_args(
                     program_id,
                     inner,
@@ -1862,10 +1934,14 @@ impl State {
             pc_wallet,
             vault_signer,
             spl_token_program,
+            referrer,
         } = args;
 
         let native_coin_amount = open_orders.native_coin_free;
         let native_pc_amount = open_orders.native_pc_free;
+
+        market.coin_deposits_total -= native_coin_amount;
+        market.pc_deposits_total -= native_pc_amount;
 
         open_orders.native_coin_free = 0;
         open_orders.native_pc_free = 0;
@@ -1896,34 +1972,39 @@ impl State {
             ),
         ];
 
+        let nonce = market.vault_signer_nonce;
         let market_pubkey = market.pubkey();
-        let vault_signer_seeds = gen_vault_signer_seeds(&market.vault_signer_nonce, &market_pubkey);
+        let vault_signer_seeds = gen_vault_signer_seeds(&nonce, &market_pubkey);
 
-        for (token_amount, wallet_account, vault) in token_infos.iter() {
-            let deposit_instruction = spl_token::instruction::transfer(
-                &spl_token::ID,
-                vault.inner().key,
-                wallet_account.inner().key,
-                &vault_signer.inner().key,
-                &[],
-                *token_amount,
+        for &(token_amount, wallet_account, vault) in token_infos.iter() {
+            send_from_vault(
+                token_amount,
+                wallet_account,
+                vault,
+                spl_token_program,
+                vault_signer,
+                &vault_signer_seeds,
             )?;
-            let accounts: &[AccountInfo] = &[
-                vault.inner().clone(),
-                wallet_account.inner().clone(),
-                vault_signer.inner().clone(),
-                spl_token_program.inner().clone(),
-            ];
-            info!("invoking...");
-            invoke_spl_token(
-                &deposit_instruction,
-                &accounts[..],
-                &[&vault_signer_seeds[..]],
-            )
-            .map_err(|_| DexErrorCode::TransferFailed)?;
-            info!("invoked");
         }
-        info!("finished transfers");
+
+        match referrer {
+            Some(referrer_pc_wallet) if open_orders.referrer_rebates_accrued > 0 => {
+                send_from_vault(
+                    open_orders.referrer_rebates_accrued,
+                    referrer_pc_wallet.token_account(),
+                    pc_vault.token_account(),
+                    spl_token_program,
+                    vault_signer,
+                    &vault_signer_seeds,
+                )?;
+            }
+            _ => {
+                market.pc_fees_accrued += open_orders.referrer_rebates_accrued;
+            }
+        };
+        market.referrer_rebates_accrued -= open_orders.referrer_rebates_accrued;
+        open_orders.referrer_rebates_accrued = 0;
+
         Ok(())
     }
 
@@ -1938,8 +2019,10 @@ impl State {
             orders_owner: _,
         } = args;
         let mut slot = None;
-        for (i, ith_client_order_id) in open_orders.client_order_ids.iter().enumerate() {
-            if *ith_client_order_id == client_order_id.get() && !open_orders.slot_is_free(i as u8) {
+        for i in 0..128 {
+            if open_orders.client_order_ids[i] == client_order_id.get()
+                && !open_orders.slot_is_free(i as u8)
+            {
                 slot = Some(i);
                 break;
             }
@@ -1948,7 +2031,7 @@ impl State {
         let side = open_orders
             .slot_side(expected_open_orders_slot)
             .ok_or(DexErrorCode::ClientIdNotFound)?;
-        let ref order_id = open_orders.orders[expected_open_orders_slot as usize];
+        let order_id = open_orders.orders[expected_open_orders_slot as usize];
         let request = Request::new(RequestView::CancelOrder {
             cancel_id: req_q.gen_seq_num(),
             expected_owner: open_orders_address,
@@ -1976,7 +2059,7 @@ impl State {
             cancel_id: req_q.gen_seq_num(),
             expected_owner: open_orders_address,
             expected_owner_slot: instruction.owner_slot,
-            order_id: &instruction.order_id,
+            order_id: instruction.order_id,
             side: instruction.side,
             client_order_id: None,
         });
@@ -2000,7 +2083,6 @@ impl State {
                 None => break,
                 Some(e) => e,
             };
-            info!("Processing an event");
 
             let view = event.as_view()?;
             let owner: [u64; 4] = event.owner;
@@ -2016,8 +2098,8 @@ impl State {
             check_assert!(event.owner_slot < 128)?;
             check_assert_eq!(&open_orders.slot_side(event.owner_slot), &Some(view.side()))?;
             check_assert_eq!(
-                &open_orders.orders[event.owner_slot as usize],
-                &event.order_id
+                open_orders.orders[event.owner_slot as usize],
+                event.order_id
             )?;
 
             match event.as_view()? {
@@ -2038,6 +2120,7 @@ impl State {
                             open_orders.native_pc_total -= native_qty_paid;
                             open_orders.native_coin_total += native_qty_received;
                             open_orders.native_coin_free += native_qty_received;
+
                             if maker {
                                 open_orders.native_pc_free += native_fee_or_rebate;
                             }
@@ -2048,10 +2131,14 @@ impl State {
                             open_orders.native_pc_free += native_qty_received;
                         }
                     };
+                    if !maker {
+                        let referrer_rebate = fees::referrer_rebate(native_fee_or_rebate);
+                        open_orders.referrer_rebates_accrued += referrer_rebate;
+                    }
                     if let Some(client_id) = client_order_id {
                         debug_assert_eq!(
                             client_id.get(),
-                            open_orders.client_order_ids[owner_slot as usize]
+                            identity(open_orders.client_order_ids[owner_slot as usize])
                         );
                     }
                 }
@@ -2083,7 +2170,7 @@ impl State {
                     if let Some(client_id) = client_order_id {
                         debug_assert_eq!(
                             client_id.get(),
-                            open_orders.client_order_ids[owner_slot as usize]
+                            identity(open_orders.client_order_ids[owner_slot as usize])
                         );
                     }
                     if fully_out {
@@ -2212,8 +2299,9 @@ impl State {
         let request = Request::new(RequestView::NewOrder {
             side: instruction.side,
             order_type: instruction.order_type,
-            order_id: &order_id,
+            order_id,
             fee_tier,
+            self_trade_behavior: instruction.self_trade_behavior,
             owner: open_orders_address,
             owner_slot,
             max_coin_qty: instruction.max_qty,
@@ -2248,35 +2336,20 @@ impl State {
         } = args;
         let token_amount = market.pc_fees_accrued;
         market.pc_fees_accrued = 0;
-        let deposit_instruction = spl_token::instruction::transfer(
-            &spl_token::ID,
-            pc_vault.account().key,
-            fee_receiver.account().key,
-            &vault_signer.inner().key,
-            &[],
-            token_amount,
-        )?;
 
+        let nonce = market.vault_signer_nonce;
         let market_pubkey = market.pubkey();
-        let vault_signer_seeds = gen_vault_signer_seeds(&market.vault_signer_nonce, &market_pubkey);
-        let accounts: &[AccountInfo] = &[
-            pc_vault.account().clone(),
-            fee_receiver.account().clone(),
-            vault_signer.inner().clone(),
-            spl_token_program.inner().clone(),
-        ];
-        info!("invoking...");
-        invoke_spl_token(
-            &deposit_instruction,
-            &accounts[..],
-            &[&vault_signer_seeds[..]],
+        let vault_signer_seeds = gen_vault_signer_seeds(&nonce, &market_pubkey);
+        send_from_vault(
+            token_amount,
+            fee_receiver.token_account(),
+            pc_vault.token_account(),
+            spl_token_program,
+            vault_signer,
+            &vault_signer_seeds,
         )
-        .map_err(|_| DexErrorCode::TransferFailed)?;
-        info!("invoked");
-        Ok(())
     }
 
-    #[inline(never)]
     fn process_initialize_market(args: account_parser::InitializeMarketArgs) -> DexResult {
         let &InitializeMarketInstruction {
             coin_lot_size,
@@ -2321,8 +2394,6 @@ impl State {
         let (eq_hdr_array, eq_buf_words) = mut_array_refs![eq_view, EQ_HEADER_WORDS; .. ;];
         let eq_buf: &[Event] = remove_slop(cast_slice(eq_buf_words));
         if eq_buf.len() < 128 {
-            let errno = DexErrorCode::EventQueueTooSmall;
-            info!(errno as u64, eq_buf.len(), 0, 0, 0);
             Err(DexErrorCode::EventQueueTooSmall)?
         }
         let eq_hdr: &mut EventQueueHeader = try_cast_mut(eq_hdr_array).or(check_unreachable!())?;
@@ -2377,6 +2448,7 @@ impl State {
 
             pc_dust_threshold,
             fee_rate_bps: fee_rate_bps as u64,
+            referrer_rebates_accrued: 0,
         };
         Ok(())
     }
